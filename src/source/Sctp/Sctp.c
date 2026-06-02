@@ -50,6 +50,11 @@ STATUS configureSctpSocket(struct socket* socket)
     initmsg.sinit_max_instreams = 300;
     CHK(usrsctp_setsockopt(socket, IPPROTO_SCTP, SCTP_INITMSG, &initmsg, SIZEOF(struct sctp_initmsg)) == 0, STATUS_SCTP_SESSION_SETUP_FAILED);
 
+    struct sctp_rtoinfo rtoinfo;
+    MEMSET(&rtoinfo, 0, SIZEOF(struct sctp_rtoinfo));
+    rtoinfo.srto_max = SCTP_RTO_MAX;
+    CHK(usrsctp_setsockopt(socket, IPPROTO_SCTP, SCTP_RTOINFO, &rtoinfo, SIZEOF(rtoinfo)) == 0, STATUS_SCTP_SESSION_SETUP_FAILED);
+
 CleanUp:
     LEAVES();
     return retStatus;
@@ -75,13 +80,14 @@ VOID deinitSctpSession()
     }
 }
 
-STATUS createSctpSession(PSctpSessionCallbacks pSctpSessionCallbacks, PSctpSession* ppSctpSession)
+STATUS createSctpSession(PSctpSessionCallbacks pSctpSessionCallbacks, TIMER_QUEUE_HANDLE timerQueueHandle, PSctpSession* ppSctpSession)
 {
     ENTERS();
     STATUS retStatus = STATUS_SUCCESS;
     PSctpSession pSctpSession = NULL;
     struct sockaddr_conn localConn, remoteConn;
     struct sctp_paddrparams params;
+    struct sctp_assocparams assocParams;
     INT32 connectStatus = 0;
 
     CHK(ppSctpSession != NULL && pSctpSessionCallbacks != NULL, STATUS_NULL_ARG);
@@ -92,6 +98,7 @@ STATUS createSctpSession(PSctpSessionCallbacks pSctpSessionCallbacks, PSctpSessi
     MEMSET(&params, 0x00, SIZEOF(struct sctp_paddrparams));
     MEMSET(&localConn, 0x00, SIZEOF(struct sockaddr_conn));
     MEMSET(&remoteConn, 0x00, SIZEOF(struct sockaddr_conn));
+    MEMSET(&assocParams, 0x00, SIZEOF(struct sctp_assocparams));
 
     ATOMIC_STORE(&pSctpSession->shutdownStatus, SCTP_SESSION_ACTIVE);
     pSctpSession->sctpSessionCallbacks = *pSctpSessionCallbacks;
@@ -112,8 +119,18 @@ STATUS createSctpSession(PSctpSessionCallbacks pSctpSessionCallbacks, PSctpSessi
     memcpy(&params.spp_address, &remoteConn, SIZEOF(remoteConn));
     params.spp_flags = SPP_PMTUD_DISABLE;
     params.spp_pathmtu = SCTP_MTU;
+    params.spp_pathmaxrxt = SCTP_MAX_PATH_RETRANSMITS;
     CHK(usrsctp_setsockopt(pSctpSession->socket, IPPROTO_SCTP, SCTP_PEER_ADDR_PARAMS, &params, SIZEOF(params)) == 0,
         STATUS_SCTP_SESSION_SETUP_FAILED);
+
+    assocParams.sasoc_asocmaxrxt = SCTP_MAX_ASSOCIATION_RETRANSMITS;
+    CHK(usrsctp_setsockopt(pSctpSession->socket, IPPROTO_SCTP, SCTP_ASSOCINFO, &assocParams, SIZEOF(assocParams)) == 0,
+        STATUS_SCTP_SESSION_SETUP_FAILED);
+
+    pSctpSession->timerQueueHandle = timerQueueHandle;
+    pSctpSession->lastTickTime = GETTIME();
+    CHK_STATUS(timerQueueAddTimer(pSctpSession->timerQueueHandle, SCTP_TIMER_START_DELAY, SCTP_TIMER_INTERVAL, sctpTimerCallback,
+                                  (UINT64) pSctpSession, &pSctpSession->timerTaskId));
 
 CleanUp:
     if (STATUS_FAILED(retStatus)) {
@@ -138,6 +155,11 @@ STATUS freeSctpSession(PSctpSession* ppSctpSession)
     pSctpSession = *ppSctpSession;
 
     CHK(pSctpSession != NULL, retStatus);
+
+    // Cancel the periodic timer before shutting down the socket
+    if (IS_VALID_TIMER_QUEUE_HANDLE(pSctpSession->timerQueueHandle)) {
+        timerQueueCancelTimer(pSctpSession->timerQueueHandle, pSctpSession->timerTaskId, (UINT64) pSctpSession);
+    }
 
     usrsctp_deregister_address(pSctpSession);
     /* handle issue mentioned here: https://github.com/sctplab/usrsctp/issues/147
@@ -297,6 +319,24 @@ STATUS putSctpPacket(PSctpSession pSctpSession, PBYTE buf, UINT32 bufLen)
     usrsctp_conninput(pSctpSession, buf, bufLen, 0);
 
     LEAVES();
+    return retStatus;
+}
+
+STATUS sctpTimerCallback(UINT32 timerID, UINT64 currentTime, UINT64 customData)
+{
+    UNUSED_PARAM(timerID);
+    STATUS retStatus = STATUS_SUCCESS;
+    PSctpSession pSctpSession = (PSctpSession) customData;
+    UINT64 elapsedMs;
+
+    CHK(pSctpSession != NULL, STATUS_NULL_ARG);
+    CHK(ATOMIC_LOAD(&pSctpSession->shutdownStatus) == SCTP_SESSION_ACTIVE, retStatus);
+
+    elapsedMs = (currentTime - pSctpSession->lastTickTime) / HUNDREDS_OF_NANOS_IN_A_MILLISECOND;
+    pSctpSession->lastTickTime = currentTime;
+    usrsctp_handle_timers((UINT32) elapsedMs);
+
+CleanUp:
     return retStatus;
 }
 
