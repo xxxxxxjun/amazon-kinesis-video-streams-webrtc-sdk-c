@@ -1,6 +1,85 @@
 #define LOG_CLASS "SCTP"
 #include "../Include_i.h"
 
+PSctpContext getSctpContext()
+{
+    ENTERS();
+    static SctpContext s = {.lastTickTime = 0, .isSctpInitialized = FALSE, .contextRefCnt = 0, .sctpContextLock = INVALID_MUTEX_VALUE};
+    ATOMIC_INCREMENT(&s.contextRefCnt);
+    LEAVES();
+    return &s;
+}
+
+VOID releaseHoldOnSctpContext(PSctpContext pSctpContext)
+{
+    ENTERS();
+    ATOMIC_DECREMENT(&pSctpContext->contextRefCnt);
+    LEAVES();
+}
+
+// Initializes SCTP context, in particular the lastTickTime used for timer handling
+STATUS createSctpContext()
+{
+    ENTERS();
+    PSctpContext pSctpContext = getSctpContext();
+    STATUS retStatus = STATUS_SUCCESS;
+    BOOL locked = FALSE;
+
+    CHK_WARN(!ATOMIC_LOAD_BOOL(&pSctpContext->isSctpInitialized), retStatus, "SCTP context already initialized, nothing to do");
+    CHK_ERR(!IS_VALID_MUTEX_VALUE(pSctpContext->sctpContextLock), retStatus, "Mutex seems to have been created already");
+
+    pSctpContext->sctpContextLock = MUTEX_CREATE(TRUE);
+    CHK_ERR(IS_VALID_MUTEX_VALUE(pSctpContext->sctpContextLock), STATUS_NULL_ARG, "Mutex creation failed");
+    MUTEX_LOCK(pSctpContext->sctpContextLock);
+    locked = TRUE;
+    pSctpContext->lastTickTime = GETTIME();
+    ATOMIC_STORE_BOOL(&pSctpContext->isSctpInitialized, TRUE);
+    DLOGI("Initialized SCTP context instance");
+
+CleanUp:
+    if (locked) {
+        MUTEX_UNLOCK(pSctpContext->sctpContextLock);
+    }
+    releaseHoldOnSctpContext(pSctpContext);
+    CHK_LOG_ERR(retStatus);
+
+    LEAVES();
+    return retStatus;
+}
+
+STATUS cleanupSctpContext()
+{
+    ENTERS();
+    STATUS retStatus = STATUS_SUCCESS;
+
+    PSctpContext pSctpContext = getSctpContext();
+
+    DLOGD("Releasing SCTP context instance from cleanupSctpContext");
+    releaseHoldOnSctpContext(pSctpContext);
+
+    CHK_WARN(ATOMIC_LOAD_BOOL(&pSctpContext->isSctpInitialized), STATUS_INVALID_OPERATION, "SCTP context not initialized, nothing to clean up");
+
+    ATOMIC_STORE_BOOL(&pSctpContext->isSctpInitialized, FALSE);
+
+    while (ATOMIC_LOAD(&pSctpContext->contextRefCnt) > 0) {
+        DLOGV("Waiting on all references to be returned...%d", pSctpContext->contextRefCnt);
+        THREAD_SLEEP(100 * HUNDREDS_OF_NANOS_IN_A_MILLISECOND);
+    }
+
+    if (IS_VALID_MUTEX_VALUE(pSctpContext->sctpContextLock)) {
+        MUTEX_FREE(pSctpContext->sctpContextLock);
+        pSctpContext->sctpContextLock = INVALID_MUTEX_VALUE;
+    }
+
+    DLOGI("Destroyed SCTP context");
+
+CleanUp:
+    CHK_LOG_ERR(retStatus);
+
+    LEAVES();
+    return retStatus;
+}
+
 STATUS initSctpAddrConn(PSctpSession pSctpSession, struct sockaddr_conn* sconn)
 {
     ENTERS();
@@ -62,6 +141,7 @@ CleanUp:
 
 STATUS initSctpSession()
 {
+    ENTERS();
     STATUS retStatus = STATUS_SUCCESS;
 
     usrsctp_init_nothreads(0, &onSctpOutboundPacket, NULL);
@@ -69,6 +149,12 @@ STATUS initSctpSession()
     // Disable Explicit Congestion Notification
     usrsctp_sysctl_set_sctp_ecn_enable(0);
 
+    CHK_STATUS(createSctpContext());
+
+CleanUp:
+    CHK_LOG_ERR(retStatus);
+
+    LEAVES();
     return retStatus;
 }
 
@@ -78,6 +164,8 @@ VOID deinitSctpSession()
     while (usrsctp_finish() != 0) {
         THREAD_SLEEP(DEFAULT_USRSCTP_TEARDOWN_POLLING_INTERVAL);
     }
+
+    cleanupSctpContext();
 }
 
 STATUS createSctpSession(PSctpSessionCallbacks pSctpSessionCallbacks, TIMER_QUEUE_HANDLE timerQueueHandle, PSctpSession* ppSctpSession)
@@ -128,7 +216,6 @@ STATUS createSctpSession(PSctpSessionCallbacks pSctpSessionCallbacks, TIMER_QUEU
         STATUS_SCTP_SESSION_SETUP_FAILED);
 
     pSctpSession->timerQueueHandle = timerQueueHandle;
-    pSctpSession->lastTickTime = GETTIME();
     CHK_STATUS(timerQueueAddTimer(pSctpSession->timerQueueHandle, SCTP_TIMER_START_DELAY, SCTP_TIMER_INTERVAL, sctpTimerCallback,
                                   (UINT64) pSctpSession, &pSctpSession->timerTaskId));
 
@@ -328,15 +415,24 @@ STATUS sctpTimerCallback(UINT32 timerID, UINT64 currentTime, UINT64 customData)
     STATUS retStatus = STATUS_SUCCESS;
     PSctpSession pSctpSession = (PSctpSession) customData;
     UINT64 elapsedMs;
+    BOOL locked = FALSE;
+    PSctpContext pSctpContext = getSctpContext();
+    CHK_WARN(ATOMIC_LOAD_BOOL(&pSctpContext->isSctpInitialized), STATUS_NULL_ARG, "SCTP context not initialized, cannot run timer callback");
 
     CHK(pSctpSession != NULL, STATUS_NULL_ARG);
     CHK(ATOMIC_LOAD(&pSctpSession->shutdownStatus) == SCTP_SESSION_ACTIVE, retStatus);
+    MUTEX_LOCK(pSctpContext->sctpContextLock);
+    locked = TRUE;
 
-    elapsedMs = (currentTime - pSctpSession->lastTickTime) / HUNDREDS_OF_NANOS_IN_A_MILLISECOND;
-    pSctpSession->lastTickTime = currentTime;
+    elapsedMs = (currentTime - pSctpContext->lastTickTime) / HUNDREDS_OF_NANOS_IN_A_MILLISECOND;
+    pSctpContext->lastTickTime = currentTime;
     usrsctp_handle_timers((UINT32) elapsedMs);
 
 CleanUp:
+    if (locked) {
+        MUTEX_UNLOCK(pSctpContext->sctpContextLock);
+    }
+    releaseHoldOnSctpContext(pSctpContext);
     CHK_LOG_ERR(retStatus);
 
     return retStatus;

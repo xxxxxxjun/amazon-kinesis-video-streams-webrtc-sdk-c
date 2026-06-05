@@ -27,7 +27,7 @@ extern "C" {
 
 #define DEFAULT_USRSCTP_TEARDOWN_POLLING_INTERVAL (10 * HUNDREDS_OF_NANOS_IN_A_MILLISECOND)
 
-#define SCTP_TIMER_INTERVAL    (50 * HUNDREDS_OF_NANOS_IN_A_MILLISECOND)
+#define SCTP_TIMER_INTERVAL    (100 * HUNDREDS_OF_NANOS_IN_A_MILLISECOND)
 #define SCTP_TIMER_START_DELAY (100 * HUNDREDS_OF_NANOS_IN_A_MILLISECOND)
 
 // Values taken from defaults suggested by RFC 9260 spec: https://www.ietf.org/rfc/rfc9260.pdf
@@ -64,6 +64,15 @@ typedef VOID (*SctpSessionDataChannelOpenFunc)(UINT64, UINT32, PBYTE, UINT32);
 // Argument is ChannelID and Message + Len
 typedef VOID (*SctpSessionDataChannelMessageFunc)(UINT64, UINT32, BOOL, PBYTE, UINT32);
 
+/// Singleton context for SCTP global state
+typedef struct SctpContext {
+    // last time the periodic usrsctp timers were called
+    UINT64 lastTickTime;
+    volatile ATOMIC_BOOL isSctpInitialized;
+    SIZE_T contextRefCnt;
+    MUTEX sctpContextLock;
+} SctpContext, *PSctpContext;
+
 typedef struct {
     UINT64 customData;
     SctpSessionOutboundPacketFunc outboundPacketFunc;
@@ -80,7 +89,6 @@ typedef struct {
     SctpSessionCallbacks sctpSessionCallbacks;
     TIMER_QUEUE_HANDLE timerQueueHandle;
     UINT32 timerTaskId;
-    UINT64 lastTickTime;
 } SctpSession, *PSctpSession;
 
 STATUS initSctpSession();
