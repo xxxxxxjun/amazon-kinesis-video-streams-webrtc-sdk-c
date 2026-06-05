@@ -337,6 +337,8 @@ STATUS sctpTimerCallback(UINT32 timerID, UINT64 currentTime, UINT64 customData)
     usrsctp_handle_timers((UINT32) elapsedMs);
 
 CleanUp:
+    CHK_LOG_ERR(retStatus);
+
     return retStatus;
 }
 
