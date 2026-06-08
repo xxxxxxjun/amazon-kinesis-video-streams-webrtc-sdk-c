@@ -30,6 +30,8 @@ extern "C" {
 #define SCTP_TIMER_INTERVAL    (100 * HUNDREDS_OF_NANOS_IN_A_MILLISECOND)
 #define SCTP_TIMER_START_DELAY (100 * HUNDREDS_OF_NANOS_IN_A_MILLISECOND)
 
+#define SCTP_CONTEXT_REFERENCE_WAIT_TIMEOUT (5 * HUNDREDS_OF_NANOS_IN_A_SECOND)
+
 // Values taken from defaults suggested by RFC 9260 spec: https://www.ietf.org/rfc/rfc9260.pdf
 
 // Max retransmits along a given single path. Typical default is 5

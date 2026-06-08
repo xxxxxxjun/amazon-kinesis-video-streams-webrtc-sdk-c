@@ -1,7 +1,7 @@
 #define LOG_CLASS "SCTP"
 #include "../Include_i.h"
 
-PSctpContext getSctpContext()
+PSctpContext acquireSctpContext()
 {
     ENTERS();
     static SctpContext s = {.lastTickTime = 0, .isSctpInitialized = FALSE, .contextRefCnt = 0, .sctpContextLock = INVALID_MUTEX_VALUE};
@@ -10,7 +10,7 @@ PSctpContext getSctpContext()
     return &s;
 }
 
-VOID releaseHoldOnSctpContext(PSctpContext pSctpContext)
+VOID releaseSctpContext(PSctpContext pSctpContext)
 {
     ENTERS();
     ATOMIC_DECREMENT(&pSctpContext->contextRefCnt);
@@ -21,7 +21,7 @@ VOID releaseHoldOnSctpContext(PSctpContext pSctpContext)
 STATUS createSctpContext()
 {
     ENTERS();
-    PSctpContext pSctpContext = getSctpContext();
+    PSctpContext pSctpContext = acquireSctpContext();
     STATUS retStatus = STATUS_SUCCESS;
     BOOL locked = FALSE;
 
@@ -40,7 +40,7 @@ CleanUp:
     if (locked) {
         MUTEX_UNLOCK(pSctpContext->sctpContextLock);
     }
-    releaseHoldOnSctpContext(pSctpContext);
+    releaseSctpContext(pSctpContext);
     CHK_LOG_ERR(retStatus);
 
     LEAVES();
@@ -50,18 +50,20 @@ CleanUp:
 STATUS cleanupSctpContext()
 {
     ENTERS();
+    UINT64 shutdownTimeout;
     STATUS retStatus = STATUS_SUCCESS;
 
-    PSctpContext pSctpContext = getSctpContext();
+    PSctpContext pSctpContext = acquireSctpContext();
 
     DLOGD("Releasing SCTP context instance from cleanupSctpContext");
-    releaseHoldOnSctpContext(pSctpContext);
+    releaseSctpContext(pSctpContext);
 
     CHK_WARN(ATOMIC_LOAD_BOOL(&pSctpContext->isSctpInitialized), STATUS_INVALID_OPERATION, "SCTP context not initialized, nothing to clean up");
 
     ATOMIC_STORE_BOOL(&pSctpContext->isSctpInitialized, FALSE);
 
-    while (ATOMIC_LOAD(&pSctpContext->contextRefCnt) > 0) {
+    shutdownTimeout = GETTIME() + SCTP_CONTEXT_REFERENCE_WAIT_TIMEOUT;
+    while (ATOMIC_LOAD(&pSctpContext->contextRefCnt) > 0 && GETTIME() < shutdownTimeout) {
         DLOGV("Waiting on all references to be returned...%d", pSctpContext->contextRefCnt);
         THREAD_SLEEP(100 * HUNDREDS_OF_NANOS_IN_A_MILLISECOND);
     }
@@ -214,6 +216,10 @@ STATUS createSctpSession(PSctpSessionCallbacks pSctpSessionCallbacks, TIMER_QUEU
     assocParams.sasoc_asocmaxrxt = SCTP_MAX_ASSOCIATION_RETRANSMITS;
     CHK(usrsctp_setsockopt(pSctpSession->socket, IPPROTO_SCTP, SCTP_ASSOCINFO, &assocParams, SIZEOF(assocParams)) == 0,
         STATUS_SCTP_SESSION_SETUP_FAILED);
+
+    // call the timer callback now to reset the last tick time for this session while ensuring that other session's
+    // queued timer tasks are correctly advanced
+    sctpTimerCallback(0, GETTIME(), (UINT64) pSctpSession);
 
     pSctpSession->timerQueueHandle = timerQueueHandle;
     CHK_STATUS(timerQueueAddTimer(pSctpSession->timerQueueHandle, SCTP_TIMER_START_DELAY, SCTP_TIMER_INTERVAL, sctpTimerCallback,
@@ -416,7 +422,7 @@ STATUS sctpTimerCallback(UINT32 timerID, UINT64 currentTime, UINT64 customData)
     PSctpSession pSctpSession = (PSctpSession) customData;
     UINT64 elapsedMs;
     BOOL locked = FALSE;
-    PSctpContext pSctpContext = getSctpContext();
+    PSctpContext pSctpContext = acquireSctpContext();
     CHK_WARN(ATOMIC_LOAD_BOOL(&pSctpContext->isSctpInitialized), STATUS_NULL_ARG, "SCTP context not initialized, cannot run timer callback");
 
     CHK(pSctpSession != NULL, STATUS_NULL_ARG);
@@ -432,7 +438,7 @@ CleanUp:
     if (locked) {
         MUTEX_UNLOCK(pSctpContext->sctpContextLock);
     }
-    releaseHoldOnSctpContext(pSctpContext);
+    releaseSctpContext(pSctpContext);
     CHK_LOG_ERR(retStatus);
 
     return retStatus;
